@@ -25,18 +25,55 @@ use sp_runtime::{
 };
 use sp_state_machine::BasicExternalities;
 use std::{
-    iter,
+    fs::OpenOptions,
+    io::Write,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
+
+#[cfg(feature = "telemetry")]
+mod telemetry;
+#[cfg(feature = "telemetry")]
+use telemetry::TelemetryLogger;
 
 fn main() {
     let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
     let genesis = generate_genesis(&accounts);
 
+    #[cfg(feature = "telemetry")]
+    let telemetry = std::env::var("TELEMETRY_DB")
+        .ok()
+        .map(|path| TelemetryLogger::new(&path).expect("Failed to initialize telemetry database"));
+
     ziggy::fuzz!(|data: &[u8]| {
+        #[cfg(feature = "telemetry")]
+        process_input(&accounts, &genesis, data, telemetry.as_ref());
+        #[cfg(not(feature = "telemetry"))]
         process_input(&accounts, &genesis, data);
     });
 }
+
+/// Log a line for runtime calls to stdout and a file (default: `fuzz_calls.log` or `FUZZ_CALL_LOG`).
+fn log_call_line(line: &str) {
+    static FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+    println!("{line}");
+
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var("FUZZ_CALL_LOG").unwrap_or_else(|_| "fuzz_calls.log".into());
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("failed to open fuzz call log file");
+        Mutex::new(file)
+    });
+
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_genesis(accounts: &[AccountId]) -> Storage {
     use kitchensink_runtime::{
@@ -316,16 +353,55 @@ fn call_filter(call: &RuntimeCall) -> bool {
     )
 }
 
-fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
+fn process_input(
+    accounts: &[AccountId],
+    genesis: &Storage,
+    data: &[u8],
+    #[cfg(feature = "telemetry")] telemetry: Option<&TelemetryLogger>,
+) {
     // We build the list of extrinsics we will execute
     let mut extrinsic_data = data;
+
+    #[cfg(feature = "telemetry")]
+    let (mut decode_attempts, mut successful_decodes, mut filtered_calls) = (0usize, 0usize, 0usize);
+
     // Vec<(next_block, origin, extrinsic)>
-    let extrinsics: Vec<(bool, u8, RuntimeCall)> =
-        iter::from_fn(|| DecodeLimit::decode_with_depth_limit(64, &mut extrinsic_data).ok())
-            .filter(|(_, _, x): &(_, _, RuntimeCall)| {
-                !recursively_find_call(x.clone(), call_filter)
-            })
-            .collect();
+    let extrinsics: Vec<(bool, u8, RuntimeCall)> = {
+        let mut result = Vec::new();
+        loop {
+            #[cfg(feature = "telemetry")]
+            {
+                decode_attempts += 1;
+            }
+
+            match DecodeLimit::decode_with_depth_limit(64, &mut extrinsic_data) {
+                Ok(item) => {
+                    #[cfg(feature = "telemetry")]
+                    {
+                        successful_decodes += 1;
+                    }
+
+                    let (next_block, origin, call): (bool, u8, RuntimeCall) = item;
+                    if recursively_find_call(call.clone(), call_filter) {
+                        #[cfg(feature = "telemetry")]
+                        {
+                            filtered_calls += 1;
+                        }
+                        continue;
+                    }
+                    result.push((next_block, origin, call));
+                }
+                Err(_) => break,
+            }
+        }
+        result
+    };
+
+    #[cfg(feature = "telemetry")]
+    if let Some(logger) = telemetry {
+        logger.log_decode_stats(decode_attempts, successful_decodes, filtered_calls);
+    }
+
     if extrinsics.is_empty() {
         return;
     }
@@ -339,7 +415,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
 
         initialize_block(block);
 
-        for (next_block, origin, extrinsic) in extrinsics {
+        for (idx, (next_block, origin, extrinsic)) in extrinsics.into_iter().enumerate() {
             if next_block {
                 // We end the current block
                 finalize_block(elapsed);
@@ -357,31 +433,41 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
             // We do not continue if the origin account does not have a free balance
             let account = Account::<Runtime>::get(&origin);
             if account.data.free == 0 {
-                #[cfg(not(feature = "fuzzing"))]
-                println!("\n    origin {origin:?} does not have free balance, skipping");
-                continue;
+                //continue;
             }
 
-            #[cfg(not(feature = "fuzzing"))]
-            println!("\n    origin:     {origin:?}");
-            #[cfg(not(feature = "fuzzing"))]
-            println!("    call:       {extrinsic:?}");
+            log_call_line(&format!(
+                "[block {block} extrinsic {idx}] origin: {origin:?} call: {extrinsic:?}"
+            ));
+
+            #[cfg(feature = "telemetry")]
+            let extrinsic_clone = if telemetry.is_some() {
+                Some(format!("{:?}", extrinsic))
+            } else {
+                None
+            };
 
             let pre_weight = extrinsic.get_dispatch_info().call_weight;
             let cumulative_weight = weight.saturating_add(pre_weight);
             if cumulative_weight.ref_time() >= 2 * WEIGHT_REF_TIME_PER_SECOND {
-                #[cfg(not(feature = "fuzzing"))]
-                println!("Extrinsic would exhaust block weight, skipping");
-                continue;
+                //continue;
             }
             weight = cumulative_weight;
 
             let now = Instant::now(); // We get the current time for timing purposes.
-            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin));
+            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin.clone()));
             elapsed += now.elapsed();
 
-            #[cfg(not(feature = "fuzzing"))]
-            println!("    result:     {res:?}");
+            log_call_line(&format!(
+                "[block {block} extrinsic {idx}] result: {res:?}"
+            ));
+
+            #[cfg(feature = "telemetry")]
+            if let Some(logger) = telemetry {
+                if let Some(call_str) = extrinsic_clone {
+                    logger.log_execution(&call_str, origin, &res);
+                }
+            }
 
             let actual_weight = res.unwrap_or_else(|e| e.post_info).actual_weight;
             let post_weight = actual_weight.unwrap_or_default();

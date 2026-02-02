@@ -6,6 +6,9 @@ publish = false
 
 [dependencies]
 ziggy = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 kitchensink-runtime = { workspace = true }
 
@@ -49,8 +52,9 @@ pallet-bags-list = { workspace = true }
 pallet-recovery = { workspace = true }
 
 [features]
-default = ["std", "try-runtime"]
+default = ["std", "try-runtime", "telemetry"]
 fuzzing = []
+telemetry = ["dep:rusqlite", "dep:serde", "dep:serde_json"]
 std = [
     "kitchensink-runtime/std",
 	"codec/std",
