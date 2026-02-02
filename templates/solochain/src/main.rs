@@ -24,11 +24,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "telemetry")]
+mod telemetry;
+#[cfg(feature = "telemetry")]
+use telemetry::TelemetryLogger;
+
 fn main() {
     let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
     let genesis = generate_genesis(&accounts);
 
+    #[cfg(feature = "telemetry")]
+    let telemetry = std::env::var("TELEMETRY_DB")
+        .ok()
+        .map(|path| TelemetryLogger::new(&path).expect("Failed to initialize telemetry database"));
+
     ziggy::fuzz!(|data: &[u8]| {
+        #[cfg(feature = "telemetry")]
+        process_input(&accounts, &genesis, data, telemetry.as_ref());
+        #[cfg(not(feature = "telemetry"))]
         process_input(&accounts, &genesis, data);
     });
 }
@@ -60,7 +73,12 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
     .unwrap()
 }
 
-fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
+fn process_input(
+    accounts: &[AccountId],
+    genesis: &Storage,
+    data: &[u8],
+    #[cfg(feature = "telemetry")] telemetry: Option<&TelemetryLogger>,
+) {
     let mut data = data;
     // We build the list of extrinsics we will execute
     let extrinsics: Vec<(
@@ -110,12 +128,26 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
             #[cfg(not(feature = "fuzzing"))]
             println!("    call:       {extrinsic:?}");
 
+            #[cfg(feature = "telemetry")]
+            let extrinsic_clone = if telemetry.is_some() {
+                Some(format!("{:?}", extrinsic))
+            } else {
+                None
+            };
+
             let now = Instant::now(); // We get the current time for timing purposes.
-            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin));
+            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin.clone()));
             elapsed += now.elapsed();
 
             #[cfg(not(feature = "fuzzing"))]
             println!("    result:     {res:?}");
+
+            #[cfg(feature = "telemetry")]
+            if let Some(logger) = telemetry {
+                if let Some(call_str) = extrinsic_clone {
+                    logger.log_execution(&call_str, origin, &res);
+                }
+            }
 
             let actual_weight = res.unwrap_or_else(|e| e.post_info).actual_weight;
             let post_weight = actual_weight.unwrap_or_default();

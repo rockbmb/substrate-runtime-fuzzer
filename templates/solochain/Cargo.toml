@@ -6,6 +6,9 @@ publish = false
 
 [dependencies]
 ziggy = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 solochain-template-runtime = { workspace = true }
 
@@ -25,6 +28,7 @@ pallet-grandpa = { workspace = true }
 [features]
 default = ["std", "try-runtime"]
 fuzzing = []
+telemetry = ["dep:rusqlite", "dep:serde", "dep:serde_json"]
 std = [
     "solochain-template-runtime/std",
 	"sp-runtime/std",
