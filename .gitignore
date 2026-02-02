@@ -3,3 +3,5 @@ cargo
 target
 output
 cargo_home
+
+campaign_data/*
