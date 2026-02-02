@@ -42,9 +42,13 @@ cumulus-test-relay-sproof-builder = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
 polkadot-primitives = { workspace = true }
 
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
 [features]
-default = ["std", "try-runtime"]
+default = ["std", "try-runtime", "telemetry"]
 fuzzing = []
+telemetry = ["rusqlite", "serde_json"]
 std = [
     "asset-hub-polkadot-runtime/std",
 	"parachains-common/std",

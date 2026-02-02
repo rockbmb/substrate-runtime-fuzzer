@@ -26,11 +26,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "telemetry")]
+mod telemetry;
+#[cfg(feature = "telemetry")]
+use telemetry::TelemetryLogger;
+
 fn main() {
     let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
     let genesis = generate_genesis(&accounts);
 
+    #[cfg(feature = "telemetry")]
+    let telemetry = std::env::var("TELEMETRY_DB")
+        .ok()
+        .map(|path| TelemetryLogger::new(&path).expect("Failed to initialize telemetry database"));
+
     ziggy::fuzz!(|data: &[u8]| {
+        #[cfg(feature = "telemetry")]
+        process_input(&accounts, &genesis, data, telemetry.as_ref());
+        #[cfg(not(feature = "telemetry"))]
         process_input(&accounts, &genesis, data);
     });
 }
@@ -133,33 +146,71 @@ fn recursively_find_call(call: RuntimeCall, matches_on: fn(RuntimeCall) -> bool)
     false
 }
 
-fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
+fn process_input(
+    accounts: &[AccountId],
+    genesis: &Storage,
+    data: &[u8],
+    #[cfg(feature = "telemetry")] telemetry: Option<&TelemetryLogger>,
+) {
     // We build the list of extrinsics we will execute
     let mut extrinsic_data = data;
+
+    #[cfg(feature = "telemetry")]
+    let (mut decode_attempts, mut successful_decodes, mut filtered_calls) = (0usize, 0usize, 0usize);
+
     // Vec<(lapse, origin, extrinsic)>
+    let extrinsics: Vec<(u8, u8, RuntimeCall)> = {
+        let mut result = Vec::new();
+        loop {
+            #[cfg(feature = "telemetry")]
+            {
+                decode_attempts += 1;
+            }
+
+            match DecodeLimit::decode_with_depth_limit(64, &mut extrinsic_data) {
+                Ok(item) => {
+                    #[cfg(feature = "telemetry")]
+                    {
+                        successful_decodes += 1;
+                    }
+
+                    let (lapse, origin, call): (u8, u8, RuntimeCall) = item;
+                    if recursively_find_call(call.clone(), |c| {
+                        // We filter out calls with Fungible(0) as they cause a debug crash
+                        matches!(c.clone(), RuntimeCall::PolkadotXcm(pallet_xcm::Call::execute { message, .. })
+                            if matches!(message.as_ref(), staging_xcm::VersionedXcm::V3(staging_xcm::v3::Xcm(msg))
+                                if msg.iter().any(|m| matches!(m, staging_xcm::opaque::v3::prelude::BuyExecution { fees: staging_xcm::v3::MultiAsset { fun, .. }, .. }
+                                    if *fun == staging_xcm::v3::Fungibility::Fungible(0)
+                                ))
+                            )
+                        ) || matches!(c.clone(), RuntimeCall::System(_))
+                        || matches!(c.clone(), RuntimeCall::AhMigrator(_))
+                        || matches!(c.clone(), RuntimeCall::Vesting(pallet_vesting::Call::vested_transfer { .. }))
+                    }) {
+                        #[cfg(feature = "telemetry")]
+                        {
+                            filtered_calls += 1;
+                        }
+                        continue;
+                    }
+                    result.push((lapse, origin, call));
+                }
+                Err(_) => break,
+            }
+        }
+        result
+    };
+
+    #[cfg(feature = "telemetry")]
+    if let Some(logger) = telemetry {
+        logger.log_decode_stats(decode_attempts, successful_decodes, filtered_calls);
+    }
+
+    if extrinsics.is_empty() {
+        return;
+    }
 
     BasicExternalities::execute_with_storage(&mut genesis.clone(), || {
-        #[allow(deprecated)]
-    let extrinsics: Vec<(u8, u8, RuntimeCall)> =
-        iter::from_fn(|| DecodeLimit::decode_with_depth_limit(64, &mut extrinsic_data).ok())
-            .filter(|(_, _, x): &(_, _, RuntimeCall)| {
-            !recursively_find_call(x.clone(), |call| {
-                // We filter out calls with Fungible(0) as they cause a debug crash
-                matches!(call.clone(), RuntimeCall::PolkadotXcm(pallet_xcm::Call::execute { message, .. })
-                    if matches!(message.as_ref(), staging_xcm::VersionedXcm::V3(staging_xcm::v3::Xcm(msg))
-                        if msg.iter().any(|m| matches!(m, staging_xcm::opaque::v3::prelude::BuyExecution { fees: staging_xcm::v3::MultiAsset { fun, .. }, .. }
-                            if *fun == staging_xcm::v3::Fungibility::Fungible(0)
-                        ))
-                    )
-                ) || matches!(call.clone(), RuntimeCall::System(_))
-                || matches!(call.clone(), RuntimeCall::AhMigrator(_))
-                || matches!(call.clone(), RuntimeCall::Vesting(pallet_vesting::Call::vested_transfer { .. }))
-            })
-        }).collect();
-
-        if extrinsics.is_empty() {
-            return;
-        }
 
         let mut block: u32 = 1;
         let mut weight: Weight = Weight::zero();
@@ -185,13 +236,20 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
             #[cfg(not(feature = "fuzzing"))]
             println!("    call:       {extrinsic:?}");
 
+            #[cfg(feature = "telemetry")]
+            let extrinsic_clone = if telemetry.is_some() {
+                Some(format!("{:?}", extrinsic))
+            } else {
+                None
+            };
+
             let pre_weight = extrinsic.get_dispatch_info().call_weight;
             let cumulative_weight = weight.saturating_add(pre_weight);
-            if cumulative_weight.ref_time() >= 2 * WEIGHT_REF_TIME_PER_SECOND {
-                #[cfg(not(feature = "fuzzing"))]
-                println!("Extrinsic would exhaust block weight, skipping");
-                continue;
-            }
+            // if cumulative_weight.ref_time() >= 2 * WEIGHT_REF_TIME_PER_SECOND {
+            //     #[cfg(not(feature = "fuzzing"))]
+            //     println!("Extrinsic would exhaust block weight, skipping");
+            //     continue;
+            // }
             weight = cumulative_weight;
 
             let origin = accounts[origin as usize % accounts.len()].clone();
@@ -200,11 +258,18 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
             println!("\n    origin:     {origin:?}");
 
             let now = Instant::now(); // We get the current time for timing purposes.
-            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin));
+            let res = extrinsic.dispatch(RuntimeOrigin::signed(origin.clone()));
             elapsed += now.elapsed();
 
             #[cfg(not(feature = "fuzzing"))]
             println!("    result:     {res:?}");
+
+            #[cfg(feature = "telemetry")]
+            if let Some(logger) = telemetry {
+                if let Some(call_str) = extrinsic_clone {
+                    logger.log_execution(&call_str, origin, &res);
+                }
+            }
 
             let actual_weight = res.unwrap_or_else(|e| e.post_info).actual_weight;
             let post_weight = actual_weight.unwrap_or_default();
