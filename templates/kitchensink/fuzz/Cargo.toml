@@ -32,15 +32,8 @@ sp-consensus-beefy = { git = "https://github.com/paritytech/polkadot-sdk.git", t
 codec = { version = "3.7.5", package = "parity-scale-codec" }
 
 [[bin]]
-name = "fuzz_target_1"
-path = "fuzz_targets/fuzz_target_1.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "balance_transfer"
-path = "fuzz_targets/balance_transfer.rs"
+name = "runtime"
+path = "fuzz_targets/runtime.rs"
 test = false
 doc = false
 bench = false

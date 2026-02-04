@@ -382,13 +382,14 @@ fn process_input(
                     }
 
                     let (next_block, origin, call): (bool, u8, RuntimeCall) = item;
-                    if recursively_find_call(call.clone(), call_filter) {
-                        #[cfg(feature = "telemetry")]
-                        {
-                            filtered_calls += 1;
-                        }
-                        continue;
-                    }
+                    // FILTER REMOVED FOR EXPERIMENT - test if filter is causing poor performance
+                    // if recursively_find_call(call.clone(), call_filter) {
+                    //     #[cfg(feature = "telemetry")]
+                    //     {
+                    //         filtered_calls += 1;
+                    //     }
+                    //     continue;
+                    // }
                     result.push((next_block, origin, call));
                 }
                 Err(_) => break,
