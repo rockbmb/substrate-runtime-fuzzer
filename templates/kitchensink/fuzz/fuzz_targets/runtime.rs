@@ -9,7 +9,7 @@ use kitchensink_runtime::{
 };
 use frame_system::Account;
 use frame_support::traits::{IntegrityTest, TryState, TryStateSelect};
-use pallet_balances::{Holds, TotalIssuance};
+use pallet_balances::Holds;
 use node_primitives::Balance;
 use sp_runtime::{
     traits::{Dispatchable, Header as HeaderT},
@@ -30,37 +30,100 @@ use sp_runtime::app_crypto::ByteArray;
 use sp_state_machine::BasicExternalities;
 use libfuzzer_sys::fuzz_target;
 
-// Wrapper to implement Arbitrary for RuntimeCall (focusing on Balances for now)
+const GENESIS_ACCOUNTS: u8 = 100;
+const ENDOWMENT: Balance = 10_000_000 * DOLLARS;
+
 #[derive(Debug)]
-struct ArbitraryRuntimeCall(RuntimeCall);
+enum CallOrigin {
+    Signed(u8), // account index
+    Root,
+}
+
+// Wrapper to implement Arbitrary for RuntimeCall with its required origin
+#[derive(Debug)]
+struct ArbitraryRuntimeCall {
+    call: RuntimeCall,
+    origin: CallOrigin,
+}
 
 impl<'a> Arbitrary<'a> for ArbitraryRuntimeCall {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        // Only generate Balances::transfer_allow_death calls
-        let dest_idx: u8 = u.arbitrary()?;
-        let amount: Balance = u.arbitrary()?;
+        let call_type: u8 = u.int_in_range(0..=4)?;
 
-        // Encode dest index in a temp account (will resolve to actual account during execution)
-        let dest = [dest_idx; 32].into();
+        let (call, origin) = match call_type {
+            0 => {
+                // transfer_allow_death
+                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+                (
+                    RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
+                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+                        value: amount,
+                    }),
+                    CallOrigin::Signed(origin_idx),
+                )
+            }
+            1 => {
+                // transfer_keep_alive
+                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+                (
+                    RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
+                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+                        value: amount,
+                    }),
+                    CallOrigin::Signed(origin_idx),
+                )
+            }
+            2 => {
+                // transfer_all
+                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let keep_alive: bool = u.arbitrary()?;
+                (
+                    RuntimeCall::Balances(pallet_balances::Call::transfer_all {
+                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+                        keep_alive,
+                    }),
+                    CallOrigin::Signed(origin_idx),
+                )
+            }
+            3 => {
+                // force_transfer (requires root)
+                let source_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+                (
+                    RuntimeCall::Balances(pallet_balances::Call::force_transfer {
+                        source: sp_runtime::MultiAddress::Id([source_idx; 32].into()),
+                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+                        value: amount,
+                    }),
+                    CallOrigin::Root,
+                )
+            }
+            4 => {
+                // force_set_balance (requires root)
+                let who_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+                let new_free: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+                (
+                    RuntimeCall::Balances(pallet_balances::Call::force_set_balance {
+                        who: sp_runtime::MultiAddress::Id([who_idx; 32].into()),
+                        new_free,
+                    }),
+                    CallOrigin::Root,
+                )
+            }
+            _ => unreachable!(),
+        };
 
-        Ok(ArbitraryRuntimeCall(
-            RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
-                dest: sp_runtime::MultiAddress::Id(dest),
-                value: amount,
-            })
-        ))
+        Ok(ArbitraryRuntimeCall { call, origin })
     }
 }
 
-#[derive(Arbitrary, Debug)]
-struct FuzzInput {
-    origin_idx: u8,
-    call: ArbitraryRuntimeCall,
-}
-
 fn minimal_genesis(accounts: &[AccountId]) -> Storage {
-    const ENDOWMENT: Balance = 10_000_000 * DOLLARS;
-
     let beefy_pair = sp_consensus_beefy::ecdsa_crypto::Pair::generate().0;
 
     RuntimeGenesisConfig {
@@ -91,15 +154,15 @@ fn minimal_genesis(accounts: &[AccountId]) -> Storage {
     .unwrap()
 }
 
-fuzz_target!(|input: FuzzInput| {
+fuzz_target!(|input: ArbitraryRuntimeCall| {
     // Initialize logger to capture try_state errors (once per process)
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Error)
         .is_test(true)
         .try_init();
 
-    // Set up 5 test accounts
-    let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
+    // Set up genesis test accounts
+    let accounts: Vec<AccountId> = (0..GENESIS_ACCOUNTS).map(|i| [i; 32].into()).collect();
     let genesis = minimal_genesis(&accounts);
 
     BasicExternalities::execute_with_storage(&mut genesis.clone(), || {
@@ -128,39 +191,25 @@ fuzz_target!(|input: FuzzInput| {
             pre_digest,
         ));
 
-        let after_init = pallet_balances::TotalIssuance::<Runtime>::get();
-
         // Set timestamp (required for block finalization)
         Timestamp::set(RuntimeOrigin::none(), u64::from(block) * SLOT_DURATION).unwrap();
 
-        let after_timestamp = pallet_balances::TotalIssuance::<Runtime>::get();
+        // Determine runtime origin based on call requirements
+        let runtime_origin = match input.origin {
+            CallOrigin::Signed(idx) => {
+                let account = accounts[idx as usize % accounts.len()].clone();
+                RuntimeOrigin::signed(account)
+            }
+            CallOrigin::Root => RuntimeOrigin::root(),
+        };
 
-        // Pick origin from accounts
-        let origin = accounts[input.origin_idx as usize % accounts.len()].clone();
-
-        // Execute the transfer
-        let _result = input.call.0.dispatch(RuntimeOrigin::signed(origin));
-
-        let after_dispatch = pallet_balances::TotalIssuance::<Runtime>::get();
+        // Execute the call
+        let _result = input.call.dispatch(runtime_origin);
 
         // Finalize block
         Executive::finalize_block();
 
-        let after_finalize = pallet_balances::TotalIssuance::<Runtime>::get();
-
-        // Debug: print when issuance changes
-        if initial_issuance != after_init {
-            eprintln!("Issuance changed during initialize_block: {} -> {}", initial_issuance, after_init);
-        }
-        if after_init != after_timestamp {
-            eprintln!("Issuance changed during timestamp set: {} -> {}", after_init, after_timestamp);
-        }
-        if after_timestamp != after_dispatch {
-            eprintln!("Issuance changed during dispatch: {} -> {}", after_timestamp, after_dispatch);
-        }
-        if after_dispatch != after_finalize {
-            eprintln!("Issuance changed during finalize: {} -> {}", after_dispatch, after_finalize);
-        }
+        let final_issuance = pallet_balances::TotalIssuance::<Runtime>::get();
 
         // Check all invariants (matching kitchensink fuzzer)
         let mut counted_free: Balance = 0;
@@ -196,18 +245,12 @@ fuzz_target!(|input: FuzzInput| {
                 sum_holds, info.data.reserved, account);
         }
 
-        let total_issuance = after_finalize;
         let counted_issuance = counted_free + counted_reserved;
 
         // Issuance must equal sum of all balances
-        assert_eq!(total_issuance, counted_issuance,
+        assert_eq!(final_issuance, counted_issuance,
             "Total issuance mismatch: recorded={}, counted={} (free={}, reserved={})",
-            total_issuance, counted_issuance, counted_free, counted_reserved);
-
-        // Issuance can only decrease, never increase
-        assert!(total_issuance <= initial_issuance,
-            "Issuance increased! initial={}, final={}, diff=+{}",
-            initial_issuance, total_issuance, total_issuance - initial_issuance);
+            final_issuance, counted_issuance, counted_free, counted_reserved);
 
         // Run developer-defined integrity tests
         AllPalletsWithSystem::integrity_test();
