@@ -221,7 +221,6 @@ fn process_input(
 
         for (lapse, origin, extrinsic) in extrinsics {
             if lapse > 0 {
-                println!("YO");
                 let prev_header = finalize_block(elapsed);
 
                 // We update our state variables
