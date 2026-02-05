@@ -29,6 +29,8 @@ use sp_core::{sr25519::Public as MixnetId, Pair};
 use sp_runtime::app_crypto::ByteArray;
 use sp_state_machine::BasicExternalities;
 use libfuzzer_sys::fuzz_target;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 const GENESIS_ACCOUNTS: u8 = 100;
 const ENDOWMENT: Balance = 10_000_000 * DOLLARS;
@@ -123,6 +125,23 @@ impl<'a> Arbitrary<'a> for ArbitraryRuntimeCall {
     }
 }
 
+// Generic newtype wrapper to ensure a Vec is never empty
+#[derive(Debug)]
+struct NonEmpty<T>(Vec<T>);
+
+impl<'a, T: Arbitrary<'a>> Arbitrary<'a> for NonEmpty<T> {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let mut items: Vec<T> = u.arbitrary()?;
+
+        // Ensure at least one element
+        if items.is_empty() {
+            items.push(u.arbitrary()?);
+        }
+
+        Ok(NonEmpty(items))
+    }
+}
+
 fn minimal_genesis(accounts: &[AccountId]) -> Storage {
     let beefy_pair = sp_consensus_beefy::ecdsa_crypto::Pair::generate().0;
 
@@ -154,7 +173,7 @@ fn minimal_genesis(accounts: &[AccountId]) -> Storage {
     .unwrap()
 }
 
-fuzz_target!(|blocks: Vec<Vec<ArbitraryRuntimeCall>>| {
+fuzz_target!(|blocks: NonEmpty<NonEmpty<ArbitraryRuntimeCall>>| {
     // Initialize logger to capture try_state errors (once per process)
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Error)
@@ -165,10 +184,32 @@ fuzz_target!(|blocks: Vec<Vec<ArbitraryRuntimeCall>>| {
     let accounts: Vec<AccountId> = (0..GENESIS_ACCOUNTS).map(|i| [i; 32].into()).collect();
     let genesis = minimal_genesis(&accounts);
 
+    // Log call structure to file
+    if let Ok(mut log_file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("runtimes.log")
+    {
+        let _ = writeln!(log_file, "\n{}", "=".repeat(80));
+        let _ = writeln!(log_file, "NEW FUZZER INPUT - {} blocks", blocks.0.len());
+        let _ = writeln!(log_file, "{}", "=".repeat(80));
+
+        for (block_idx, block_calls) in blocks.0.iter().enumerate() {
+            let _ = writeln!(log_file, "\nBlock {}:", block_idx + 1);
+            for (call_idx, call) in block_calls.0.iter().enumerate() {
+                let origin_str = match &call.origin {
+                    CallOrigin::Signed(idx) => format!("Signed(account_{})", idx),
+                    CallOrigin::Root => "Root".to_string(),
+                };
+                let _ = writeln!(log_file, "  Call {}: {:?} (origin: {})", call_idx + 1, call.call, origin_str);
+            }
+        }
+    }
+
     BasicExternalities::execute_with_storage(&mut genesis.clone(), || {
         type Header = sp_runtime::generic::Header<u32, sp_runtime::traits::BlakeTwo256>;
 
-        for (block_idx, block_calls) in blocks.iter().enumerate() {
+        for (block_idx, block_calls) in blocks.0.iter().enumerate() {
             let block_num = (block_idx as u32) + 1;
 
             // Initialize block
@@ -195,7 +236,7 @@ fuzz_target!(|blocks: Vec<Vec<ArbitraryRuntimeCall>>| {
             Timestamp::set(RuntimeOrigin::none(), u64::from(block_num) * SLOT_DURATION).unwrap();
 
             // Execute all calls in this block
-            for call in block_calls {
+            for (call_idx, call) in block_calls.0.iter().enumerate() {
                 let runtime_origin = match call.origin {
                     CallOrigin::Signed(idx) => {
                         let account = accounts[idx as usize % accounts.len()].clone();
@@ -204,7 +245,19 @@ fuzz_target!(|blocks: Vec<Vec<ArbitraryRuntimeCall>>| {
                     CallOrigin::Root => RuntimeOrigin::root(),
                 };
 
-                let _result = call.call.clone().dispatch(runtime_origin);
+                let result = call.call.clone().dispatch(runtime_origin);
+
+                // Log dispatch result
+                if let Ok(mut log_file) = OpenOptions::new()
+                    .append(true)
+                    .open("runtimes.log")
+                {
+                    let result_str = match &result {
+                        Ok(_) => "✓ Ok".to_string(),
+                        Err(e) => format!("✗ Err({:?})", e.error),
+                    };
+                    let _ = writeln!(log_file, "    → Block {} Call {} result: {}", block_num, call_idx + 1, result_str);
+                }
             }
 
             // Finalize block
