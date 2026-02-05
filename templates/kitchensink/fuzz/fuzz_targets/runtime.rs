@@ -154,7 +154,7 @@ fn minimal_genesis(accounts: &[AccountId]) -> Storage {
     .unwrap()
 }
 
-fuzz_target!(|input: ArbitraryRuntimeCall| {
+fuzz_target!(|blocks: Vec<Vec<ArbitraryRuntimeCall>>| {
     // Initialize logger to capture try_state errors (once per process)
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Error)
@@ -166,99 +166,100 @@ fuzz_target!(|input: ArbitraryRuntimeCall| {
     let genesis = minimal_genesis(&accounts);
 
     BasicExternalities::execute_with_storage(&mut genesis.clone(), || {
-        // Capture initial issuance
-        let initial_issuance = pallet_balances::TotalIssuance::<Runtime>::get();
-
-        // Initialize block 1
-        let block = 1u32;
-        let pre_digest = Digest {
-            logs: vec![DigestItem::PreRuntime(
-                BABE_ENGINE_ID,
-                PreDigest::SecondaryPlain(SecondaryPlainPreDigest {
-                    slot: Slot::from(u64::from(block)),
-                    authority_index: 42,
-                })
-                .encode(),
-            )],
-        };
-
         type Header = sp_runtime::generic::Header<u32, sp_runtime::traits::BlakeTwo256>;
-        Executive::initialize_block(&Header::new(
-            block,
-            H256::default(),
-            H256::default(),
-            H256::default(),
-            pre_digest,
-        ));
 
-        // Set timestamp (required for block finalization)
-        Timestamp::set(RuntimeOrigin::none(), u64::from(block) * SLOT_DURATION).unwrap();
+        for (block_idx, block_calls) in blocks.iter().enumerate() {
+            let block_num = (block_idx as u32) + 1;
 
-        // Determine runtime origin based on call requirements
-        let runtime_origin = match input.origin {
-            CallOrigin::Signed(idx) => {
-                let account = accounts[idx as usize % accounts.len()].clone();
-                RuntimeOrigin::signed(account)
+            // Initialize block
+            let pre_digest = Digest {
+                logs: vec![DigestItem::PreRuntime(
+                    BABE_ENGINE_ID,
+                    PreDigest::SecondaryPlain(SecondaryPlainPreDigest {
+                        slot: Slot::from(u64::from(block_num)),
+                        authority_index: 42,
+                    })
+                    .encode(),
+                )],
+            };
+
+            Executive::initialize_block(&Header::new(
+                block_num,
+                H256::default(),
+                H256::default(),
+                H256::default(),
+                pre_digest,
+            ));
+
+            // Set timestamp (required for block finalization)
+            Timestamp::set(RuntimeOrigin::none(), u64::from(block_num) * SLOT_DURATION).unwrap();
+
+            // Execute all calls in this block
+            for call in block_calls {
+                let runtime_origin = match call.origin {
+                    CallOrigin::Signed(idx) => {
+                        let account = accounts[idx as usize % accounts.len()].clone();
+                        RuntimeOrigin::signed(account)
+                    }
+                    CallOrigin::Root => RuntimeOrigin::root(),
+                };
+
+                let _result = call.call.clone().dispatch(runtime_origin);
             }
-            CallOrigin::Root => RuntimeOrigin::root(),
-        };
 
-        // Execute the call
-        let _result = input.call.dispatch(runtime_origin);
+            // Finalize block
+            Executive::finalize_block();
 
-        // Finalize block
-        Executive::finalize_block();
+            // Check all invariants after each block
+            let final_issuance = pallet_balances::TotalIssuance::<Runtime>::get();
+            let mut counted_free: Balance = 0;
+            let mut counted_reserved: Balance = 0;
 
-        let final_issuance = pallet_balances::TotalIssuance::<Runtime>::get();
+            for (account, info) in Account::<Runtime>::iter() {
+                let consumers = info.consumers;
+                let providers = info.providers;
+                assert!(!(consumers > 0 && providers == 0),
+                    "Invalid consumer/provider state for account {:?}: consumers={}, providers={}",
+                    account, consumers, providers);
 
-        // Check all invariants (matching kitchensink fuzzer)
-        let mut counted_free: Balance = 0;
-        let mut counted_reserved: Balance = 0;
+                counted_free += info.data.free;
+                counted_reserved += info.data.reserved;
 
-        for (account, info) in Account::<Runtime>::iter() {
-            let consumers = info.consumers;
-            let providers = info.providers;
-            assert!(!(consumers > 0 && providers == 0),
-                "Invalid consumer/provider state for account {:?}: consumers={}, providers={}",
-                account, consumers, providers);
+                // Check max lock equals frozen balance
+                let max_lock: Balance = Balances::locks(&account)
+                    .iter()
+                    .map(|l| l.amount)
+                    .max()
+                    .unwrap_or_default();
+                assert_eq!(max_lock, info.data.frozen,
+                    "Max lock should equal frozen balance for {:?}: max_lock={}, frozen={}",
+                    account, max_lock, info.data.frozen);
 
-            counted_free += info.data.free;
-            counted_reserved += info.data.reserved;
+                // Check sum of holds <= reserved
+                let sum_holds: Balance = Holds::<Runtime>::get(&account)
+                    .iter()
+                    .map(|l| l.amount)
+                    .sum();
+                assert!(sum_holds <= info.data.reserved,
+                    "Sum of holds ({}) exceeds reserved balance ({}) for {:?}",
+                    sum_holds, info.data.reserved, account);
+            }
 
-            // Check max lock equals frozen balance
-            let max_lock: Balance = Balances::locks(&account)
-                .iter()
-                .map(|l| l.amount)
-                .max()
-                .unwrap_or_default();
-            assert_eq!(max_lock, info.data.frozen,
-                "Max lock should equal frozen balance for {:?}: max_lock={}, frozen={}",
-                account, max_lock, info.data.frozen);
+            let counted_issuance = counted_free + counted_reserved;
 
-            // Check sum of holds <= reserved
-            let sum_holds: Balance = Holds::<Runtime>::get(&account)
-                .iter()
-                .map(|l| l.amount)
-                .sum();
-            assert!(sum_holds <= info.data.reserved,
-                "Sum of holds ({}) exceeds reserved balance ({}) for {:?}",
-                sum_holds, info.data.reserved, account);
-        }
+            // Issuance must equal sum of all balances
+            assert_eq!(final_issuance, counted_issuance,
+                "Total issuance mismatch at block {}: recorded={}, counted={} (free={}, reserved={})",
+                block_num, final_issuance, counted_issuance, counted_free, counted_reserved);
 
-        let counted_issuance = counted_free + counted_reserved;
+            // Run developer-defined integrity tests
+            AllPalletsWithSystem::integrity_test();
 
-        // Issuance must equal sum of all balances
-        assert_eq!(final_issuance, counted_issuance,
-            "Total issuance mismatch: recorded={}, counted={} (free={}, reserved={})",
-            final_issuance, counted_issuance, counted_free, counted_reserved);
-
-        // Run developer-defined integrity tests
-        AllPalletsWithSystem::integrity_test();
-
-        // Run try_state checks for all pallets
-        if let Err(e) = AllPalletsWithSystem::try_state(block, TryStateSelect::All) {
-            eprintln!("try_state failed: {:?}", e);
-            panic!("try_state check failed: {:?}", e);
+            // Run try_state checks for all pallets
+            if let Err(e) = AllPalletsWithSystem::try_state(block_num, TryStateSelect::All) {
+                eprintln!("try_state failed at block {}: {:?}", block_num, e);
+                panic!("try_state check failed at block {}: {:?}", block_num, e);
+            }
         }
     });
 });
