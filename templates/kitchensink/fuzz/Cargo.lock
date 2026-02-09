@@ -6455,13 +6455,16 @@ dependencies = [
  "pallet-grandpa",
  "pallet-im-online",
  "pallet-timestamp",
+ "pallet-vesting",
  "parity-scale-codec",
+ "rand 0.8.5",
  "sp-authority-discovery",
  "sp-consensus-babe",
  "sp-consensus-beefy",
  "sp-core",
  "sp-runtime",
  "sp-state-machine",
+ "statrs",
 ]
 
 [[package]]
@@ -7668,6 +7671,8 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
+ "rand 0.8.5",
+ "rand_distr",
  "simba",
  "typenum",
 ]
@@ -16810,6 +16815,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "statrs"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a3fe7c28c6512e766b0874335db33c94ad7b8f9054228ae1c2abd47ce7d335e"
+dependencies = [
+ "approx",
+ "nalgebra",
+ "num-traits",
+ "rand 0.8.5",
 ]
 
 [[package]]

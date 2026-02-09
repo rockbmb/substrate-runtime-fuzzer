@@ -3,14 +3,13 @@
 use arbitrary::{Arbitrary, Unstructured};
 use kitchensink_runtime::{
     constants::{currency::DOLLARS, time::SLOT_DURATION},
-    AccountId, AllPalletsWithSystem, Balances, Executive, Runtime, RuntimeCall, RuntimeOrigin,
+    AccountId, AllPalletsWithSystem, Executive, RuntimeCall, RuntimeOrigin,
     RuntimeGenesisConfig, BalancesConfig, SystemConfig, Timestamp,
     BeefyConfig, SessionConfig, SessionKeys,
 };
-use frame_system::Account;
-use frame_support::traits::{IntegrityTest, TryState, TryStateSelect};
-use pallet_balances::Holds;
-use node_primitives::Balance;
+use frame_support::traits::{TryState, TryStateSelect};
+use pallet_vesting::VestingInfo;
+use node_primitives::{Balance, BlockNumber};
 use sp_runtime::{
     traits::{Dispatchable, Header as HeaderT},
     testing::H256,
@@ -27,100 +26,164 @@ use pallet_im_online::sr25519::AuthorityId as ImOnlineId;
 use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
 use sp_core::{sr25519::Public as MixnetId, Pair};
 use sp_runtime::app_crypto::ByteArray;
-use sp_state_machine::BasicExternalities;
 use libfuzzer_sys::fuzz_target;
 use std::fs::OpenOptions;
 use std::io::Write;
+use sp_consensus_beefy::ecdsa_crypto;
 
 const GENESIS_ACCOUNTS: u8 = 100;
 const ENDOWMENT: Balance = 10_000_000 * DOLLARS;
 
 #[derive(Debug)]
 enum CallOrigin {
-    Signed(u8), // account index
+    Signed(u8),
     Root,
 }
 
-// Wrapper to implement Arbitrary for RuntimeCall with its required origin
 #[derive(Debug)]
 struct ArbitraryRuntimeCall {
     call: RuntimeCall,
     origin: CallOrigin,
 }
 
+// Call generator specification
+struct CallSpec {
+    weight: u32,
+    generator: fn(&mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)>,
+}
+
+fn gen_transfer_allow_death(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+    Ok((
+        RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
+            dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            value: amount,
+        }),
+        CallOrigin::Signed(origin_idx),
+    ))
+}
+
+fn gen_transfer_keep_alive(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+    Ok((
+        RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
+            dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            value: amount,
+        }),
+        CallOrigin::Signed(origin_idx),
+    ))
+}
+
+fn gen_transfer_all(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let keep_alive: bool = u.arbitrary()?;
+    Ok((
+        RuntimeCall::Balances(pallet_balances::Call::transfer_all {
+            dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            keep_alive,
+        }),
+        CallOrigin::Signed(origin_idx),
+    ))
+}
+
+fn gen_force_transfer(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let source_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+    Ok((
+        RuntimeCall::Balances(pallet_balances::Call::force_transfer {
+            source: sp_runtime::MultiAddress::Id([source_idx; 32].into()),
+            dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            value: amount,
+        }),
+        CallOrigin::Root,
+    ))
+}
+
+fn gen_force_set_balance(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let who_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let new_free: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
+    Ok((
+        RuntimeCall::Balances(pallet_balances::Call::force_set_balance {
+            who: sp_runtime::MultiAddress::Id([who_idx; 32].into()),
+            new_free,
+        }),
+        CallOrigin::Root,
+    ))
+}
+
+fn gen_vested_transfer(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let locked: Balance = u.int_in_range((100 * DOLLARS)..=(50 * ENDOWMENT))?;
+    let per_block: Balance = u.int_in_range(1..=(locked / 100).max(1))?;
+    let starting_block: BlockNumber = u.int_in_range(1..=1000)?;
+    Ok((
+        RuntimeCall::Vesting(pallet_vesting::Call::vested_transfer {
+            target: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            schedule: VestingInfo::new(locked, per_block, starting_block),
+        }),
+        CallOrigin::Signed(origin_idx),
+    ))
+}
+
+fn gen_vest(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    Ok((
+        RuntimeCall::Vesting(pallet_vesting::Call::vest {}),
+        CallOrigin::Signed(origin_idx),
+    ))
+}
+
+fn gen_force_vested_transfer(u: &mut Unstructured) -> arbitrary::Result<(RuntimeCall, CallOrigin)> {
+    let source_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
+    let locked: Balance = u.int_in_range((100 * DOLLARS)..=(50 * ENDOWMENT))?;
+    let per_block: Balance = u.int_in_range(1..=(locked / 100).max(1))?;
+    let starting_block: BlockNumber = u.int_in_range(1..=1000)?;
+    Ok((
+        RuntimeCall::Vesting(pallet_vesting::Call::force_vested_transfer {
+            source: sp_runtime::MultiAddress::Id([source_idx; 32].into()),
+            target: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
+            schedule: VestingInfo::new(locked, per_block, starting_block),
+        }),
+        CallOrigin::Root,
+    ))
+}
+
+// Call registry
+const CALL_SPECS: &[CallSpec] = &[
+    CallSpec { weight: 10, generator: gen_transfer_allow_death },
+    CallSpec { weight: 10, generator: gen_transfer_keep_alive },
+    CallSpec { weight: 5, generator: gen_transfer_all },
+    CallSpec { weight: 2, generator: gen_force_transfer },
+    CallSpec { weight: 1, generator: gen_force_set_balance },
+    CallSpec { weight: 8, generator: gen_vested_transfer },
+    CallSpec { weight: 5, generator: gen_vest },
+    CallSpec { weight: 2, generator: gen_force_vested_transfer },
+];
+
 impl<'a> Arbitrary<'a> for ArbitraryRuntimeCall {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let call_type: u8 = u.int_in_range(0..=4)?;
+        let total_weight: u32 = CALL_SPECS.iter().map(|s| s.weight).sum();
+        let rand_value: u32 = u.int_in_range(0..=u32::MAX)?;
+        let mut threshold = ((rand_value as u64 * total_weight as u64) / u32::MAX as u64) as u32;
 
-        let (call, origin) = match call_type {
-            0 => {
-                // transfer_allow_death
-                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
-                (
-                    RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
-                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
-                        value: amount,
-                    }),
-                    CallOrigin::Signed(origin_idx),
-                )
+        for spec in CALL_SPECS {
+            if threshold < spec.weight {
+                let (call, origin) = (spec.generator)(u)?;
+                return Ok(ArbitraryRuntimeCall { call, origin });
             }
-            1 => {
-                // transfer_keep_alive
-                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
-                (
-                    RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
-                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
-                        value: amount,
-                    }),
-                    CallOrigin::Signed(origin_idx),
-                )
-            }
-            2 => {
-                // transfer_all
-                let origin_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let keep_alive: bool = u.arbitrary()?;
-                (
-                    RuntimeCall::Balances(pallet_balances::Call::transfer_all {
-                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
-                        keep_alive,
-                    }),
-                    CallOrigin::Signed(origin_idx),
-                )
-            }
-            3 => {
-                // force_transfer (requires root)
-                let source_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let dest_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let amount: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
-                (
-                    RuntimeCall::Balances(pallet_balances::Call::force_transfer {
-                        source: sp_runtime::MultiAddress::Id([source_idx; 32].into()),
-                        dest: sp_runtime::MultiAddress::Id([dest_idx; 32].into()),
-                        value: amount,
-                    }),
-                    CallOrigin::Root,
-                )
-            }
-            4 => {
-                // force_set_balance (requires root)
-                let who_idx: u8 = u.int_in_range(0..=(GENESIS_ACCOUNTS - 1))?;
-                let new_free: Balance = u.int_in_range(0..=(100 * ENDOWMENT))?;
-                (
-                    RuntimeCall::Balances(pallet_balances::Call::force_set_balance {
-                        who: sp_runtime::MultiAddress::Id([who_idx; 32].into()),
-                        new_free,
-                    }),
-                    CallOrigin::Root,
-                )
-            }
-            _ => unreachable!(),
-        };
+            threshold -= spec.weight;
+        }
 
+        // Fallback
+        let (call, origin) = (CALL_SPECS[0].generator)(u)?;
         Ok(ArbitraryRuntimeCall { call, origin })
     }
 }
@@ -132,29 +195,50 @@ struct NonEmpty<T>(Vec<T>);
 impl<'a, T: Arbitrary<'a>> Arbitrary<'a> for NonEmpty<T> {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let mut items: Vec<T> = u.arbitrary()?;
-
-        // Ensure at least one element
         if items.is_empty() {
             items.push(u.arbitrary()?);
         }
-
         Ok(NonEmpty(items))
     }
 }
 
-fn minimal_genesis(accounts: &[AccountId]) -> Storage {
-    let beefy_pair = sp_consensus_beefy::ecdsa_crypto::Pair::generate().0;
+// Top-level structure: Vec<Vec<Call>> representing multiple blocks
+#[derive(Debug)]
+struct MultiBlockCalls(Vec<NonEmpty<ArbitraryRuntimeCall>>);
+
+impl<'a> Arbitrary<'a> for MultiBlockCalls {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let blocks: Vec<NonEmpty<ArbitraryRuntimeCall>> = u.arbitrary()?;
+        if blocks.is_empty() {
+            let single_block: NonEmpty<ArbitraryRuntimeCall> = u.arbitrary()?;
+            Ok(MultiBlockCalls(vec![single_block]))
+        } else {
+            Ok(MultiBlockCalls(blocks))
+        }
+    }
+}
+
+fn genesis_config() -> RuntimeGenesisConfig {
+    let endowed_accounts: Vec<AccountId> = (0..GENESIS_ACCOUNTS)
+        .map(|i| AccountId::from([i; 32]))
+        .collect();
+
+    // Generate beefy keypair for proper initialization
+    let beefy_pair = ecdsa_crypto::Pair::generate().0;
 
     RuntimeGenesisConfig {
         system: SystemConfig::default(),
         balances: BalancesConfig {
-            balances: accounts.iter().cloned().map(|x| (x, ENDOWMENT)).collect(),
+            balances: endowed_accounts
+                .iter()
+                .map(|k| (k.clone(), ENDOWMENT))
+                .collect(),
             dev_accounts: None,
         },
         session: SessionConfig {
             keys: vec![(
-                [0; 32].into(),
-                [0; 32].into(),
+                [0; 32].into(),  // account
+                [0; 32].into(),  // stash
                 SessionKeys {
                     grandpa: GrandpaId::from_slice(&[0; 32]).unwrap(),
                     babe: BabeId::from_slice(&[0; 32]).unwrap(),
@@ -169,22 +253,50 @@ fn minimal_genesis(accounts: &[AccountId]) -> Storage {
         beefy: BeefyConfig::default(),
         ..Default::default()
     }
-    .build_storage()
-    .unwrap()
 }
 
-fuzz_target!(|blocks: NonEmpty<NonEmpty<ArbitraryRuntimeCall>>| {
-    // Initialize logger to capture try_state errors (once per process)
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Error)
-        .is_test(true)
-        .try_init();
+fn create_block_builder_with_genesis() -> (Storage, RuntimeGenesisConfig) {
+    let genesis_config = genesis_config();
+    let storage = genesis_config.build_storage().expect("Storage should build");
+    (storage, genesis_config)
+}
 
-    // Set up genesis test accounts
-    let accounts: Vec<AccountId> = (0..GENESIS_ACCOUNTS).map(|i| [i; 32].into()).collect();
-    let genesis = minimal_genesis(&accounts);
+fn initialize_block(block_number: u32, parent_hash: H256) {
+    let slot = Slot::from(block_number as u64);
+    let pre_digest = Digest {
+        logs: vec![DigestItem::PreRuntime(
+            BABE_ENGINE_ID,
+            PreDigest::SecondaryPlain(SecondaryPlainPreDigest {
+                authority_index: 0,
+                slot,
+            })
+            .encode(),
+        )],
+    };
 
-    // Log call structure to file
+    let header = sp_runtime::generic::Header::<u32, sp_runtime::traits::BlakeTwo256>::new(
+        block_number,
+        Default::default(),
+        Default::default(),
+        parent_hash,
+        pre_digest,
+    );
+
+    Executive::initialize_block(&header);
+    Timestamp::set_timestamp((block_number as u64) * SLOT_DURATION);
+}
+
+fn finalize_block(_block_number: u32) -> H256 {
+    let header = Executive::finalize_block();
+    H256::from_slice(header.hash().as_ref())
+}
+
+fuzz_target!(|blocks: MultiBlockCalls| {
+    env_logger::try_init().ok();
+
+    let (mut storage, _genesis_config) = create_block_builder_with_genesis();
+    let mut parent_hash = H256::default();
+
     if let Ok(mut log_file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -206,48 +318,22 @@ fuzz_target!(|blocks: NonEmpty<NonEmpty<ArbitraryRuntimeCall>>| {
         }
     }
 
-    BasicExternalities::execute_with_storage(&mut genesis.clone(), || {
-        type Header = sp_runtime::generic::Header<u32, sp_runtime::traits::BlakeTwo256>;
+    for (block_num, block) in blocks.0.iter().enumerate() {
+        let block_number = (block_num + 1) as u32;
 
-        for (block_idx, block_calls) in blocks.0.iter().enumerate() {
-            let block_num = (block_idx as u32) + 1;
+        sp_state_machine::BasicExternalities::execute_with_storage(&mut storage, || {
+            initialize_block(block_number, parent_hash);
 
-            // Initialize block
-            let pre_digest = Digest {
-                logs: vec![DigestItem::PreRuntime(
-                    BABE_ENGINE_ID,
-                    PreDigest::SecondaryPlain(SecondaryPlainPreDigest {
-                        slot: Slot::from(u64::from(block_num)),
-                        authority_index: 42,
-                    })
-                    .encode(),
-                )],
-            };
-
-            Executive::initialize_block(&Header::new(
-                block_num,
-                H256::default(),
-                H256::default(),
-                H256::default(),
-                pre_digest,
-            ));
-
-            // Set timestamp (required for block finalization)
-            Timestamp::set(RuntimeOrigin::none(), u64::from(block_num) * SLOT_DURATION).unwrap();
-
-            // Execute all calls in this block
-            for (call_idx, call) in block_calls.0.iter().enumerate() {
+            for (call_idx, call) in block.0.iter().enumerate() {
                 let runtime_origin = match call.origin {
-                    CallOrigin::Signed(idx) => {
-                        let account = accounts[idx as usize % accounts.len()].clone();
-                        RuntimeOrigin::signed(account)
+                    CallOrigin::Signed(account_idx) => {
+                        RuntimeOrigin::signed(AccountId::from([account_idx; 32]))
                     }
                     CallOrigin::Root => RuntimeOrigin::root(),
                 };
 
                 let result = call.call.clone().dispatch(runtime_origin);
 
-                // Log dispatch result
                 if let Ok(mut log_file) = OpenOptions::new()
                     .append(true)
                     .open("runtimes.log")
@@ -260,59 +346,11 @@ fuzz_target!(|blocks: NonEmpty<NonEmpty<ArbitraryRuntimeCall>>| {
                 }
             }
 
-            // Finalize block
-            Executive::finalize_block();
+            parent_hash = finalize_block(block_number);
+        });
 
-            // Check all invariants after each block
-            let final_issuance = pallet_balances::TotalIssuance::<Runtime>::get();
-            let mut counted_free: Balance = 0;
-            let mut counted_reserved: Balance = 0;
-
-            for (account, info) in Account::<Runtime>::iter() {
-                let consumers = info.consumers;
-                let providers = info.providers;
-                assert!(!(consumers > 0 && providers == 0),
-                    "Invalid consumer/provider state for account {:?}: consumers={}, providers={}",
-                    account, consumers, providers);
-
-                counted_free += info.data.free;
-                counted_reserved += info.data.reserved;
-
-                // Check max lock equals frozen balance
-                let max_lock: Balance = Balances::locks(&account)
-                    .iter()
-                    .map(|l| l.amount)
-                    .max()
-                    .unwrap_or_default();
-                assert_eq!(max_lock, info.data.frozen,
-                    "Max lock should equal frozen balance for {:?}: max_lock={}, frozen={}",
-                    account, max_lock, info.data.frozen);
-
-                // Check sum of holds <= reserved
-                let sum_holds: Balance = Holds::<Runtime>::get(&account)
-                    .iter()
-                    .map(|l| l.amount)
-                    .sum();
-                assert!(sum_holds <= info.data.reserved,
-                    "Sum of holds ({}) exceeds reserved balance ({}) for {:?}",
-                    sum_holds, info.data.reserved, account);
-            }
-
-            let counted_issuance = counted_free + counted_reserved;
-
-            // Issuance must equal sum of all balances
-            assert_eq!(final_issuance, counted_issuance,
-                "Total issuance mismatch at block {}: recorded={}, counted={} (free={}, reserved={})",
-                block_num, final_issuance, counted_issuance, counted_free, counted_reserved);
-
-            // Run developer-defined integrity tests
-            AllPalletsWithSystem::integrity_test();
-
-            // Run try_state checks for all pallets
-            if let Err(e) = AllPalletsWithSystem::try_state(block_num, TryStateSelect::All) {
-                eprintln!("try_state failed at block {}: {:?}", block_num, e);
-                panic!("try_state check failed at block {}: {:?}", block_num, e);
-            }
-        }
-    });
+        sp_state_machine::BasicExternalities::execute_with_storage(&mut storage, || {
+            AllPalletsWithSystem::try_state(block_number as u32, TryStateSelect::All).unwrap();
+        });
+    }
 });
