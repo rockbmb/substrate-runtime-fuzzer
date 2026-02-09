@@ -1,11 +1,13 @@
 //! Telemetry module for capturing fuzzing campaign data.
 //!
-//! This module provides batched database writes for two types of records:
+//! This module provides database writes for two types of records:
 //! - **Execution records**: Details of each runtime call execution (variant, args, origin, result)
+//!   - Flushed **immediately** to ensure data capture (no batching)
 //! - **Decode statistics**: Per-iteration stats on SCALE decoding success/failure rates
+//!   - Batched at 100 records per transaction to minimize overhead
 //!
-//! Both record types use batched writes (100 records per transaction) to minimize
-//! database overhead and avoid locking issues during parallel fuzzing.
+//! The immediate flush for executions trades performance for data integrity - original
+//! batched design lost data on fuzzer crashes.
 //!
 //! Database errors are logged to stderr but never crash the fuzzer.
 
@@ -15,7 +17,13 @@ use kitchensink_runtime::{AccountId, RuntimeCall};
 use sp_runtime::DispatchResultWithInfo;
 use std::sync::Mutex;
 
-const BATCH_SIZE: usize = 100;
+// NOTE: Execution records flush immediately (BATCH_SIZE effectively unused).
+// Original batched design lost data on fuzzer crashes. Immediate flush ensures
+// all executions are captured, trading performance for data integrity.
+const BATCH_SIZE: usize = 10;
+
+// Decode stats use true batching - statistical data over millions of iterations
+// means losing <100 records on crash is negligible.
 const DECODE_STATS_BATCH_SIZE: usize = 100;
 
 struct ExecutionRecord {
@@ -92,9 +100,8 @@ impl TelemetryLogger {
         if let Ok(mut buffer) = self.exec_buffer.lock() {
             buffer.push(record);
 
-            if buffer.len() >= BATCH_SIZE {
-                self.flush_exec_buffer(&mut buffer);
-            }
+            // Always flush immediately to avoid losing data on panic
+            self.flush_exec_buffer(&mut buffer);
         }
     }
 
