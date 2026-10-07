@@ -44,7 +44,7 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         AuthorityDiscoveryConfig, BabeConfig, BalancesConfig, BeefyConfig, BrokerConfig,
         CouncilConfig, DemocracyConfig, ElectionsConfig, GluttonConfig, GrandpaConfig,
         ImOnlineConfig, IndicesConfig, MixnetConfig, NominationPoolsConfig, PoolAssetsConfig,
-        PsmConfig, ReviveConfig, RuntimeGenesisConfig, SafeModeConfig, SessionConfig, SessionKeys,
+        ReviveConfig, RuntimeGenesisConfig, SafeModeConfig, SessionConfig, SessionKeys,
         SocietyConfig, StakingConfig, SudoConfig, SystemConfig, TechnicalCommitteeConfig,
         TechnicalMembershipConfig, TransactionPaymentConfig, TransactionStorageConfig,
         TreasuryConfig, TxPauseConfig, VestingConfig,
@@ -159,7 +159,6 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         mixnet: MixnetConfig::default(),
         broker: BrokerConfig::default(),
         revive: ReviveConfig::default(),
-        psm: PsmConfig::default(),
         asset_conversion: AssetConversionConfig::default(),
     }
     .build_storage()
@@ -180,22 +179,118 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
             },
         )
         .unwrap();
-        /*
-        // WIP: found the society before each input
-        RuntimeCall::Sudo(pallet_sudo::Call::sudo {
-            call: RuntimeCall::Society(pallet_society::Call::found_society {
-                founder: AccountId::from([0; 32]).into(),
-                max_members: 2,
-                max_intake: 2,
-                max_strikes: 2,
-                candidate_deposit: 1_000,
-                rules: vec![0],
-            })
-            .into(),
-        })
-        .dispatch(RuntimeOrigin::root())
+
+        // pUSD system setup. Without a registered PSM the pallet's calls all
+        // return PsmNotFound, so the fuzzer would never reach its logic.
+        //
+        // Asset 1 is the stablecoin the PSM mints; asset 2 is the external it
+        // holds in reserve. Both carry six decimals, which the PSM records at
+        // registration.
+        let owner = AccountId::from([0; 32]);
+        for (id, symbol) in [(1u32, b"PUSD".to_vec()), (2u32, b"USDT".to_vec())] {
+            kitchensink_runtime::Assets::force_create(
+                RuntimeOrigin::root(),
+                id.into(),
+                owner.clone().into(),
+                true,
+                1,
+            )
+            .unwrap();
+            kitchensink_runtime::Assets::set_metadata(
+                RuntimeOrigin::signed(owner.clone()),
+                id.into(),
+                symbol.clone(),
+                symbol,
+                6,
+            )
+            .unwrap();
+        }
+
+        // Fund the fuzzer's accounts with the external asset so mints can happen.
+        for i in 0..5u8 {
+            kitchensink_runtime::Assets::mint(
+                RuntimeOrigin::signed(owner.clone()),
+                2u32.into(),
+                AccountId::from([i; 32]).into(),
+                1_000_000_000_000,
+            )
+            .unwrap();
+        }
+
+        let admin = kitchensink_runtime::OriginCaller::system(frame_system::RawOrigin::Signed(owner.clone()));
+        kitchensink_runtime::Psm::create_psm(
+            RuntimeOrigin::signed(owner.clone()),
+            1u32,
+            Box::new(admin.clone()),
+            Box::new(admin),
+            owner.clone(),
+            1_000_000_000_000,
+            1_000_000,
+        )
         .unwrap();
-        */
+        kitchensink_runtime::Psm::add_external_asset(RuntimeOrigin::signed(owner.clone()), 1u32, 2u32)
+            .unwrap();
+        kitchensink_runtime::Psm::set_asset_ceiling_weight(
+            RuntimeOrigin::signed(owner.clone()),
+            1u32,
+            2u32,
+            sp_runtime::Permill::one(),
+        )
+        .unwrap();
+
+        // A vault market over the same stablecoin, so the two pallets mint the
+        // same asset and the cross-pallet checks have both halves to compare.
+        // Without a branch, every check in pallet-vaults iterates empty maps.
+        //
+        // `do_create_branch` reads the oracle before anything else, so the price
+        // has to exist first. The value is a FixedU128 inner, scaled by 10^18;
+        // the key for native collateral is `VaultsNativePriceFeedId`, u32::MAX.
+        // The oracle combines a price only once `MinimumCount` distinct members
+        // have fed it, so the feeders must be members first. Membership is set
+        // here rather than in genesis, where it would re-initialize the
+        // technical committee that its own genesis already built.
+        for i in 0..5u8 {
+            kitchensink_runtime::TechnicalMembership::add_member(
+                RuntimeOrigin::root(),
+                AccountId::from([i; 32]).into(),
+            )
+            .unwrap();
+        }
+
+        for i in 0..5u8 {
+            kitchensink_runtime::Oracle::feed_values(
+                RuntimeOrigin::signed(AccountId::from([i; 32])),
+                vec![(u32::MAX, 10_000_000_000_000_000_000u128)]
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+
+        kitchensink_runtime::Vaults::create_branch(
+            RuntimeOrigin::root(),
+            frame_support::traits::fungible::NativeOrWithId::Native,
+            1u32,
+            pallet_vaults::types::BranchAdmins {
+                full_admin: owner.clone().into(),
+                emergency_admin: owner.into(),
+            },
+            pallet_vaults::types::BranchConfig {
+                minimum_collateralization_ratio: sp_runtime::FixedU128::from_rational(110, 100),
+                initial_collateralization_ratio: sp_runtime::FixedU128::from_rational(120, 100),
+                safety_collateralization_ratio: sp_runtime::FixedU128::from_rational(130, 100),
+                debt_ceiling: 1_000_000_000_000,
+                minimum_debt: 200,
+                minimum_collateral: 10 * DOLLARS,
+                minimum_borrow_rate: sp_runtime::FixedU128::from_rational(1, 1000),
+                maximum_borrow_rate: sp_runtime::FixedU128::from_rational(400, 100),
+                upfront_fee_period: 604_800_000,
+                rate_adjustment_cooldown: 86_400_000,
+                redistribution_penalty: sp_runtime::Permill::from_percent(5),
+            },
+            (),
+        )
+        .unwrap();
     });
     storage
 }
@@ -333,6 +428,20 @@ fn call_filter(call: &RuntimeCall) -> bool {
     || matches!(
             &call,
             RuntimeCall::Vesting(pallet_vesting::Call::vested_transfer { .. })
+    )
+    // Kitchensink carries 97 pallets. Without this, the campaign spends nearly
+    // all of its budget on pallets the pUSD invariants say nothing about, which
+    // is how a `Revive` call ended up in a hang from the first run. Keep only
+    // the pallets that can move pUSD, its collateral, or the price that values
+    // it.
+    || !matches!(
+            &call,
+            RuntimeCall::Psm(..)
+            | RuntimeCall::Vaults(..)
+            | RuntimeCall::Assets(..)
+            | RuntimeCall::Balances(..)
+            | RuntimeCall::Oracle(..)
+            | RuntimeCall::Utility(..)
     )
 }
 
