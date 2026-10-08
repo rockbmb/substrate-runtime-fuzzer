@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ziggy = { workspace = true }
+serde_json = "1"
 
 kitchensink-runtime = { workspace = true }
 
@@ -29,6 +30,7 @@ sp-crypto-hashing = {workspace = true}
 pallet-timestamp = { workspace = true }
 pallet-balances = { workspace = true }
 pallet-vaults = { workspace = true }
+linked-list-interface = { workspace = true }
 pallet-grandpa = { workspace = true }
 pallet-staking = { workspace = true }
 pallet-im-online = { workspace = true }

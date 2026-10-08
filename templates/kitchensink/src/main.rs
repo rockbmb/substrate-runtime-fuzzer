@@ -260,7 +260,7 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         for i in 0..5u8 {
             kitchensink_runtime::Oracle::feed_values(
                 RuntimeOrigin::signed(AccountId::from([i; 32])),
-                vec![(u32::MAX, 10_000_000_000_000_000_000u128)]
+                vec![(u32::MAX, oct10_price(0, 0))]
                     .try_into()
                     .unwrap(),
             )
@@ -289,6 +289,122 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
                 redistribution_penalty: sp_runtime::Permill::from_percent(5),
             },
             (),
+        )
+        .unwrap();
+
+        // The fuzzer dispatches from these five accounts. While one of them owns
+        // the stablecoin it can call `Assets::mint` and raise issuance without
+        // either pallet recording debt, which is not a defect the cross-pallet
+        // check is meant to report. Ownership moves to an account the fuzzer
+        // never signs as. Both pallets mint through `fungibles`, not ownership,
+        // so they are unaffected.
+        kitchensink_runtime::Assets::set_team(
+            RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+            1u32.into(),
+            AccountId::from([9u8; 32]).into(),
+            AccountId::from([9u8; 32]).into(),
+            AccountId::from([9u8; 32]).into(),
+        )
+        .unwrap();
+        // Vaults opened at the ICR floor, so the first ticks of the replayed
+        // crash push them under MCR and the liquidation paths become one call
+        // away for the fuzzer. The boundary debt is probed rather than derived:
+        // binary-search the largest accepted debt at fixed collateral, then
+        // open at 95% of it. PUSD_GENESIS_VAULTS picks the count; later
+        // presets can vary the distribution.
+        kitchensink_runtime::Vaults::set_global_debt_ceiling(
+            RuntimeOrigin::root(),
+            1u32,
+            1_000_000_000_000,
+        )
+        .unwrap();
+
+        let vault_count: u8 = std::env::var("PUSD_GENESIS_VAULTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let collateral: Balance = 1_000 * DOLLARS;
+        for i in 0..vault_count.min(5) {
+            let who = AccountId::from([i; 32]);
+            // Fees on open land in debt.interest, so a borrower holding only
+            // the principal cannot fully repay during the probe. A PSM mint
+            // provides the buffer, and records matching debt, so the
+            // cross-pallet equality is unaffected.
+            kitchensink_runtime::Psm::mint(
+                RuntimeOrigin::signed(who.clone()),
+                1u32,
+                2u32,
+                100_000_000_000,
+                sp_runtime::Permill::one(),
+            )
+            .unwrap();
+            let open = |debt: Balance| {
+                kitchensink_runtime::Vaults::open_vault(
+                    RuntimeOrigin::signed(who.clone()),
+                    frame_support::traits::fungible::NativeOrWithId::Native,
+                    1u32,
+                    collateral,
+                    debt,
+                    sp_runtime::FixedU128::from_rational(5, 100),
+                    linked_list_interface::Position::endpoints_only(),
+                )
+            };
+            let close = || {
+                kitchensink_runtime::Vaults::close_vault(
+                    RuntimeOrigin::signed(who.clone()),
+                    frame_support::traits::fungible::NativeOrWithId::Native,
+                    1u32,
+                    None,
+                )
+            };
+            if std::env::var("PUSD_PROBE").is_ok() {
+                for exp in 0..15u32 {
+                    let d: Balance = 10u128.pow(exp);
+                    let r = open(d);
+                    eprintln!("probe debt=1e{exp}: {r:?}");
+                    if r.is_ok() {
+                        let _ = kitchensink_runtime::Vaults::repay_for(
+                            RuntimeOrigin::signed(who.clone()),
+                            frame_support::traits::fungible::NativeOrWithId::Native,
+                            1u32,
+                            who.clone().into(),
+                            None,
+                        );
+                        let _ = close();
+                    }
+                }
+            }
+            let (mut lo, mut hi): (Balance, Balance) = (1, 1_000_000_000_000_000);
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if open(mid).is_ok() {
+                    kitchensink_runtime::Vaults::repay_for(
+                        RuntimeOrigin::signed(who.clone()),
+                        frame_support::traits::fungible::NativeOrWithId::Native,
+                        1u32,
+                        who.clone().into(),
+                        None,
+                    )
+                    .expect("probe repay");
+                    close().expect("probe close");
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            open(lo * 95 / 100).expect("open at 95% of the ICR boundary");
+        }
+
+        kitchensink_runtime::Balances::transfer_allow_death(
+            RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+            AccountId::from([9u8; 32]).into(),
+            1_000 * DOLLARS,
+        )
+        .unwrap();
+        kitchensink_runtime::Assets::transfer_ownership(
+            RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+            1u32.into(),
+            AccountId::from([9u8; 32]).into(),
         )
         .unwrap();
     });
@@ -440,12 +556,17 @@ fn call_filter(call: &RuntimeCall) -> bool {
             | RuntimeCall::Vaults(..)
             | RuntimeCall::Assets(..)
             | RuntimeCall::Balances(..)
-            | RuntimeCall::Oracle(..)
             | RuntimeCall::Utility(..)
     )
 }
 
 fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
+    // The first byte picks where in the crash this input starts: 0 is the
+    // calm minute, 128 the freefall, 255 the rebound. The rest is extrinsics.
+    let (start_tick, data) = match data.split_first() {
+        Some((b, rest)) => ((*b as usize).saturating_mul(2).min(449), rest),
+        None => return,
+    };
     // We build the list of extrinsics we will execute
     let mut extrinsic_data = data;
     // Vec<(advance_block, origin, extrinsic)>
@@ -467,6 +588,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
         let initial_total_issuance = TotalIssuance::<Runtime>::get();
 
         initialize_block(block);
+        feed_oct10_price(start_tick, block);
 
         for (advance_block, origin, extrinsic) in extrinsics {
             if advance_block {
@@ -477,6 +599,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
                 elapsed = Duration::ZERO;
 
                 initialize_block(block);
+        feed_oct10_price(start_tick, block);
             }
 
             let origin = accounts[origin as usize % accounts.len()].clone();
@@ -521,6 +644,42 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
         check_invariants(block, initial_total_issuance);
     });
 }
+
+/// DOT/USD through the 10 October 2025 crash: best-bid/ask mids from the
+/// `oct-10-crash` preset of paritytech/price-oracle-testing, medianed across
+/// venues, 2s ticks, as FixedU128 inner values. Calm 3.74, bottom 2.75,
+/// rebound 3.00.
+static OCT10_DOT_USD: &str = include_str!("../oct10_dot_usd.json");
+
+/// The price at `block`, walking the crash at `OCT10_STRIDE` ticks per block
+/// so the bottom arrives within a typical input's block count.
+const OCT10_STRIDE: usize = 45;
+
+fn oct10_price(start_tick: usize, block: u32) -> u128 {
+    static SERIES: std::sync::OnceLock<Vec<u128>> = std::sync::OnceLock::new();
+    let series = SERIES.get_or_init(|| {
+        serde_json::from_str::<Vec<String>>(OCT10_DOT_USD)
+            .expect("series parses")
+            .into_iter()
+            .map(|v| v.parse().expect("inner value parses"))
+            .collect()
+    });
+    let idx = start_tick
+        .saturating_add((block as usize).saturating_mul(OCT10_STRIDE))
+        .min(series.len() - 1);
+    series[idx]
+}
+
+fn feed_oct10_price(start_tick: usize, block: u32) {
+    let price = oct10_price(start_tick, block);
+    for i in 0..5u8 {
+        let _ = kitchensink_runtime::Oracle::feed_values(
+            RuntimeOrigin::signed(AccountId::from([i; 32])),
+            vec![(u32::MAX, price)].try_into().expect("one pair fits"),
+        );
+    }
+}
+
 fn initialize_block(block: u32) {
     #[cfg(not(feature = "fuzzing"))]
     println!("\ninitializing block {block}");
