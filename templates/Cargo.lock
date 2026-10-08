@@ -7130,7 +7130,6 @@ dependencies = [
  "pallet-whitelist",
  "parity-scale-codec",
  "scale-info",
- "serde_json",
  "sp-authority-discovery",
  "sp-consensus-babe",
  "sp-consensus-beefy",

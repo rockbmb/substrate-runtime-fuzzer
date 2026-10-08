@@ -29,6 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod oct10;
+
 fn main() {
     let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
     let genesis = generate_genesis(&accounts);
@@ -260,7 +262,7 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         for i in 0..5u8 {
             kitchensink_runtime::Oracle::feed_values(
                 RuntimeOrigin::signed(AccountId::from([i; 32])),
-                vec![(u32::MAX, oct10_price(0, 0))]
+                vec![(u32::MAX, price_replay::price_at(0, 0))]
                     .try_into()
                     .unwrap(),
             )
@@ -564,7 +566,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
     // The first byte picks where in the crash this input starts: 0 is the
     // calm minute, 128 the freefall, 255 the rebound. The rest is extrinsics.
     let (start_tick, data) = match data.split_first() {
-        Some((b, rest)) => ((*b as usize).saturating_mul(2).min(449), rest),
+        Some((b, rest)) => (price_replay::start_tick(*b), rest),
         None => return,
     };
     // We build the list of extrinsics we will execute
@@ -588,7 +590,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
         let initial_total_issuance = TotalIssuance::<Runtime>::get();
 
         initialize_block(block);
-        feed_oct10_price(start_tick, block);
+        price_replay::feed(start_tick, block);
 
         for (advance_block, origin, extrinsic) in extrinsics {
             if advance_block {
@@ -599,7 +601,7 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
                 elapsed = Duration::ZERO;
 
                 initialize_block(block);
-        feed_oct10_price(start_tick, block);
+        price_replay::feed(start_tick, block);
             }
 
             let origin = accounts[origin as usize % accounts.len()].clone();
@@ -645,38 +647,86 @@ fn process_input(accounts: &[AccountId], genesis: &Storage, data: &[u8]) {
     });
 }
 
-/// DOT/USD through the 10 October 2025 crash: best-bid/ask mids from the
-/// `oct-10-crash` preset of paritytech/price-oracle-testing, medianed across
-/// venues, 2s ticks, as FixedU128 inner values. Calm 3.74, bottom 2.75,
-/// rebound 3.00.
-static OCT10_DOT_USD: &str = include_str!("../oct10_dot_usd.json");
+mod price_replay {
+    //! The price the runtime sees, replayed from the 10 October 2025 crash.
+    //!
+    //! Static prices left the interesting vaults code unreachable: liquidation,
+    //! redistribution and FinalRecovery only run when collateral loses value.
+    //! This module walks the recorded crash instead. The series and its
+    //! provenance live in [`crate::oct10`]; the genesis vaults that the falling
+    //! price pushes under water are opened in `generate_genesis`.
+    //!
+    //! How the cursor moves:
+    //! - An input's first byte picks the starting tick, scaled onto the series:
+    //!   byte 0 starts at the calm, ~128 in the freefall, 255 near the end.
+    //!   Without it, most inputs (which rarely exceed two blocks) would spend
+    //!   the whole campaign at the calm price.
+    //! - Each block advances the cursor by `TICKS_PER_BLOCK`, compressing the
+    //!   15-minute window into the handful of blocks one input reaches:
+    //!   calm to bottom in ~7 blocks at 45 ticks each.
+    //! - Past the end, the cursor stays on the last tick.
+    //!
+    //! How the price reaches the runtime: at the start of every block,
+    //! `feed(..)` submits the tick's value from the five oracle member
+    //! accounts. Five, because the runtime's `DefaultCombineData` publishes a
+    //! median only once `MinimumCount = 5` members have reported. Re-feeding
+    //! every block also keeps the values inside the oracle's `ExpiresIn`
+    //! window regardless of how far block timestamps jump. `Oracle` calls are
+    //! excluded from the fuzzed call set (see `call_filter`), so the replay is
+    //! the only writer and the trajectory is authoritative; adversarial feeds
+    //! are a separate, future experiment.
+    //!
+    //! `PUSD_PRICE_SERIES=median|binance` picks the series at startup:
+    //! `median` is what a median oracle over the recorded venues would
+    //! publish (bottoms at -26%), `binance` the single collapsing venue
+    //! (bottoms at $0.98, -74%), which reaches the undercollateralized
+    //! FinalRecovery regime that the median path never touches.
 
-/// The price at `block`, walking the crash at `OCT10_STRIDE` ticks per block
-/// so the bottom arrives within a typical input's block count.
-const OCT10_STRIDE: usize = 45;
+    use super::{AccountId, RuntimeOrigin};
+    use crate::oct10;
 
-fn oct10_price(start_tick: usize, block: u32) -> u128 {
-    static SERIES: std::sync::OnceLock<Vec<u128>> = std::sync::OnceLock::new();
-    let series = SERIES.get_or_init(|| {
-        serde_json::from_str::<Vec<String>>(OCT10_DOT_USD)
-            .expect("series parses")
-            .into_iter()
-            .map(|v| v.parse().expect("inner value parses"))
-            .collect()
-    });
-    let idx = start_tick
-        .saturating_add((block as usize).saturating_mul(OCT10_STRIDE))
-        .min(series.len() - 1);
-    series[idx]
-}
+    pub const TICKS_PER_BLOCK: usize = 45;
 
-fn feed_oct10_price(start_tick: usize, block: u32) {
-    let price = oct10_price(start_tick, block);
-    for i in 0..5u8 {
-        let _ = kitchensink_runtime::Oracle::feed_values(
-            RuntimeOrigin::signed(AccountId::from([i; 32])),
-            vec![(u32::MAX, price)].try_into().expect("one pair fits"),
-        );
+    /// The oracle key the runtime's vaults adapter reads for native
+    /// collateral (`VaultsNativePriceFeedId`).
+    const NATIVE_FEED_KEY: u32 = u32::MAX;
+
+    fn series() -> &'static [u128] {
+        static CHOICE: std::sync::OnceLock<&'static [u128]> = std::sync::OnceLock::new();
+        CHOICE.get_or_init(|| {
+            match std::env::var("PUSD_PRICE_SERIES").as_deref() {
+                Ok("binance") => &oct10::BINANCE[..],
+                _ => &oct10::MEDIAN[..],
+            }
+        })
+    }
+
+    /// Scale an input's first byte onto the series, so every crash phase is
+    /// reachable from the first block of an input.
+    pub fn start_tick(byte: u8) -> usize {
+        byte as usize * series().len() / 256
+    }
+
+    pub fn price_at(start_tick: usize, block: u32) -> u128 {
+        let s = series();
+        let idx = start_tick
+            .saturating_add((block as usize).saturating_mul(TICKS_PER_BLOCK))
+            .min(s.len() - 1);
+        s[idx]
+    }
+
+    /// Feed the tick's price from every oracle member. Errors are ignored on
+    /// purpose: a member may be unable to feed in exotic fuzzed states (for
+    /// example after its account is reaped), and a missing feed only leaves
+    /// the previous tick's price standing, which is a valid market state.
+    pub fn feed(start_tick: usize, block: u32) {
+        let price = price_at(start_tick, block);
+        for i in 0..5u8 {
+            let _ = kitchensink_runtime::Oracle::feed_values(
+                RuntimeOrigin::signed(AccountId::from([i; 32])),
+                vec![(NATIVE_FEED_KEY, price)].try_into().expect("one pair fits the bound"),
+            );
+        }
     }
 }
 

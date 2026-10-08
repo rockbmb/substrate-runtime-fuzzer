@@ -5,3 +5,5 @@ output
 cargo_home
 seedgen
 campaign_data
+output-*
+*.log
