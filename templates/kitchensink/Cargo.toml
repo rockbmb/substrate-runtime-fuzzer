@@ -30,6 +30,7 @@ sp-crypto-hashing = {workspace = true}
 pallet-timestamp = { workspace = true }
 pallet-balances = { workspace = true }
 pallet-vaults = { workspace = true }
+pallet-psm = { workspace = true, default-features = true }
 linked-list-interface = { workspace = true }
 pallet-grandpa = { workspace = true }
 pallet-staking = { workspace = true }

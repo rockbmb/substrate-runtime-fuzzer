@@ -69,4 +69,5 @@ pallet-bounties = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/sub
 pallet-asset-conversion = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/substrate/frame/asset-conversion", default-features = false }
 pallet-vesting = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/substrate/frame/vesting", default-features = false }
 pallet-vaults = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/substrate/frame/vaults", default-features = false }
+pallet-psm = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/substrate/frame/psm", default-features = false }
 linked-list-interface = { path = "/home/ubuntu/Work/polkadot-sdk/pusd-cross-checks/substrate/frame/linked-list/interface", default-features = false }

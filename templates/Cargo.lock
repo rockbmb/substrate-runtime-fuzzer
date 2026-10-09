@@ -7114,6 +7114,7 @@ dependencies = [
  "pallet-meta-tx",
  "pallet-multisig",
  "pallet-proxy",
+ "pallet-psm",
  "pallet-recovery",
  "pallet-referenda",
  "pallet-remark",
