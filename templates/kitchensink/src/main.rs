@@ -194,7 +194,16 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         // holds in reserve. Both carry six decimals, which the PSM records at
         // registration.
         let owner = AccountId::from([0; 32]);
-        for (id, symbol) in [(1u32, b"PUSD".to_vec()), (2u32, b"USDT".to_vec())] {
+        // Asset 3 carries 2 decimals. The 6-vs-6 pair of assets 1 and 2 makes
+        // the PSM's scale conversions the identity, so no input can express a
+        // truncation bug there; the 2-decimal external forces the scale-down
+        // path, where redeem's round-trip loses dust and the debt arithmetic
+        // has something to get wrong.
+        for (id, symbol, decimals) in [
+            (1u32, b"PUSD".to_vec(), 6u8),
+            (2u32, b"USDT".to_vec(), 6u8),
+            (3u32, b"USDX".to_vec(), 2u8),
+        ] {
             kitchensink_runtime::Assets::force_create(
                 RuntimeOrigin::root(),
                 id.into(),
@@ -208,20 +217,22 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
                 id.into(),
                 symbol.clone(),
                 symbol,
-                6,
+                decimals,
             )
             .unwrap();
         }
 
         // Fund the fuzzer's accounts with the external asset so mints can happen.
         for i in 0..5u8 {
-            kitchensink_runtime::Assets::mint(
-                RuntimeOrigin::signed(owner.clone()),
-                2u32.into(),
-                AccountId::from([i; 32]).into(),
-                1_000_000_000_000,
-            )
-            .unwrap();
+            for (ext, amount) in [(2u32, 1_000_000_000_000u128), (3u32, 100_000_000)] {
+                kitchensink_runtime::Assets::mint(
+                    RuntimeOrigin::signed(owner.clone()),
+                    ext.into(),
+                    AccountId::from([i; 32]).into(),
+                    amount,
+                )
+                .unwrap();
+            }
         }
 
         let admin = kitchensink_runtime::OriginCaller::system(frame_system::RawOrigin::Signed(owner.clone()));
@@ -235,15 +246,22 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
             1_000_000,
         )
         .unwrap();
-        kitchensink_runtime::Psm::add_external_asset(RuntimeOrigin::signed(owner.clone()), 1u32, 2u32)
+        for ext in [2u32, 3u32] {
+            kitchensink_runtime::Psm::add_external_asset(
+                RuntimeOrigin::signed(owner.clone()),
+                1u32,
+                ext,
+            )
             .unwrap();
-        kitchensink_runtime::Psm::set_asset_ceiling_weight(
-            RuntimeOrigin::signed(owner.clone()),
-            1u32,
-            2u32,
-            sp_runtime::Permill::one(),
-        )
-        .unwrap();
+            kitchensink_runtime::Psm::set_asset_ceiling_weight(
+                RuntimeOrigin::signed(owner.clone()),
+                1u32,
+                ext,
+                sp_runtime::Permill::from_percent(50),
+            )
+            .unwrap();
+        }
+
 
         // A vault market over the same stablecoin, so the two pallets mint the
         // same asset and the cross-pallet checks have both halves to compare.
