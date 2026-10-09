@@ -321,80 +321,127 @@ fn generate_genesis(accounts: &[AccountId]) -> Storage {
         )
         .unwrap();
 
-        let vault_count: u8 = std::env::var("PUSD_GENESIS_VAULTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let collateral: Balance = 1_000 * DOLLARS;
-        for i in 0..vault_count.min(5) {
-            let who = AccountId::from([i; 32]);
-            // Fees on open land in debt.interest, so a borrower holding only
-            // the principal cannot fully repay during the probe. A PSM mint
-            // provides the buffer, and records matching debt, so the
-            // cross-pallet equality is unaffected.
-            kitchensink_runtime::Psm::mint(
+        // Genesis vault population, from PUSD_GENESIS_VAULTS: "count@CR"
+        // bands, comma-separated. "20@2.5" is a healthy herd the crash should
+        // not kill; "5@1.21" hugs the ICR floor and goes underwater within the
+        // first slide; "10@2.5,10@1.21" splits the two. Default three vaults
+        // just above the floor.
+        //
+        // Debt for a target CR comes from the probed ICR boundary rather than
+        // decimal arithmetic: one binary search finds the largest debt the
+        // pallet accepts at this collateral (CR there equals ICR by
+        // definition), and debt = boundary * ICR / CR gives any other ratio.
+        // The probe needs a pUSD buffer to repay its trial vaults, because
+        // open charges an upfront fee; a PSM mint provides it and records
+        // matching debt, so the cross-pallet equality is unaffected.
+        //
+        // Owners are accounts [100+j; 32], outside the fuzzer's five origins,
+        // so fuzzed calls manage these vaults only through permissionless
+        // paths (liquidate, poke, repay_for), the same way a stranger would.
+        const GENESIS_ICR: f64 = 1.2;
+        let bands: Vec<(u32, f64)> = std::env::var("PUSD_GENESIS_VAULTS")
+            .unwrap_or_else(|_| "3@1.26".into())
+            .split(',')
+            .map(|band| {
+                let (n, cr) = band.split_once('@').expect("band is count@CR");
+                let n: u32 = n.trim().parse().expect("count parses");
+                let cr: f64 = cr.trim().parse().expect("CR parses");
+                assert!(cr >= 1.21, "CR below the ICR floor cannot be opened");
+                (n, cr)
+            })
+            .collect();
+        // Small enough that the ICR bound, not the branch debt ceiling, is
+        // what the probe finds: the ceiling is shared across the branch, so a
+        // ceiling-bound vault fills it alone and leaves the band's CR
+        // arithmetic meaningless. 10 DOLLARS keeps thirty vaults under 30% of
+        // the ceiling.
+        let collateral: Balance = 10 * DOLLARS;
+
+        let probe_owner = AccountId::from([99u8; 32]);
+        kitchensink_runtime::Balances::transfer_allow_death(
+            RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+            probe_owner.clone().into(),
+            100_000 * DOLLARS,
+        )
+        .unwrap();
+        kitchensink_runtime::Assets::mint(
+            RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+            2u32.into(),
+            probe_owner.clone().into(),
+            1_000_000_000_000,
+        )
+        .unwrap();
+        kitchensink_runtime::Psm::mint(
+            RuntimeOrigin::signed(probe_owner.clone()),
+            1u32,
+            2u32,
+            100_000_000_000,
+            sp_runtime::Permill::one(),
+        )
+        .unwrap();
+        // Each vault gets its own rate, rising with the owner index. Same-rate
+        // inserts pile into one cluster that the endpoints-only hint cannot
+        // reach once the cluster outgrows the linked list's repair budget;
+        // distinct rising rates land every insert at the head end, which the
+        // hint reaches directly. Distinct rates also spread the redemption
+        // order, which same-rate genesis would collapse.
+        let open_as = |who: &AccountId, rate_bps: u32, debt: Balance| {
+            kitchensink_runtime::Vaults::open_vault(
                 RuntimeOrigin::signed(who.clone()),
+                frame_support::traits::fungible::NativeOrWithId::Native,
                 1u32,
-                2u32,
-                100_000_000_000,
-                sp_runtime::Permill::one(),
+                collateral,
+                debt,
+                sp_runtime::FixedU128::from_rational(rate_bps as u128, 10_000),
+                linked_list_interface::Position::endpoints_only(),
             )
-            .unwrap();
-            let open = |debt: Balance| {
-                kitchensink_runtime::Vaults::open_vault(
-                    RuntimeOrigin::signed(who.clone()),
+        };
+        let (mut lo, mut hi): (Balance, Balance) = (1, 1_000_000_000_000_000);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if open_as(&probe_owner, 500, mid).is_ok() {
+                kitchensink_runtime::Vaults::repay_for(
+                    RuntimeOrigin::signed(probe_owner.clone()),
                     frame_support::traits::fungible::NativeOrWithId::Native,
                     1u32,
-                    collateral,
-                    debt,
-                    sp_runtime::FixedU128::from_rational(5, 100),
-                    linked_list_interface::Position::endpoints_only(),
+                    probe_owner.clone().into(),
+                    None,
                 )
-            };
-            let close = || {
+                .expect("probe repay");
                 kitchensink_runtime::Vaults::close_vault(
-                    RuntimeOrigin::signed(who.clone()),
+                    RuntimeOrigin::signed(probe_owner.clone()),
                     frame_support::traits::fungible::NativeOrWithId::Native,
                     1u32,
                     None,
                 )
-            };
+                .expect("probe close");
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let boundary = lo;
+        if std::env::var("PUSD_PROBE").is_ok() {
+            eprintln!("genesis: probed ICR-boundary debt = {boundary}");
+        }
+
+        let mut owner_index: u8 = 100;
+        for (count, cr) in bands {
+            let debt = (boundary as f64 * GENESIS_ICR / cr) as Balance;
             if std::env::var("PUSD_PROBE").is_ok() {
-                for exp in 0..15u32 {
-                    let d: Balance = 10u128.pow(exp);
-                    let r = open(d);
-                    eprintln!("probe debt=1e{exp}: {r:?}");
-                    if r.is_ok() {
-                        let _ = kitchensink_runtime::Vaults::repay_for(
-                            RuntimeOrigin::signed(who.clone()),
-                            frame_support::traits::fungible::NativeOrWithId::Native,
-                            1u32,
-                            who.clone().into(),
-                            None,
-                        );
-                        let _ = close();
-                    }
-                }
+                eprintln!("genesis: band {count}@{cr} -> debt {debt}");
             }
-            let (mut lo, mut hi): (Balance, Balance) = (1, 1_000_000_000_000_000);
-            while lo + 1 < hi {
-                let mid = lo + (hi - lo) / 2;
-                if open(mid).is_ok() {
-                    kitchensink_runtime::Vaults::repay_for(
-                        RuntimeOrigin::signed(who.clone()),
-                        frame_support::traits::fungible::NativeOrWithId::Native,
-                        1u32,
-                        who.clone().into(),
-                        None,
-                    )
-                    .expect("probe repay");
-                    close().expect("probe close");
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
+            for _ in 0..count {
+                let who = AccountId::from([owner_index; 32]);
+                owner_index = owner_index.checked_add(1).expect("fewer than 156 vaults");
+                kitchensink_runtime::Balances::transfer_allow_death(
+                    RuntimeOrigin::signed(AccountId::from([0u8; 32])),
+                    who.clone().into(),
+                    2_000 * DOLLARS,
+                )
+                .unwrap();
+                open_as(&who, 500 + owner_index as u32, debt).expect("open at the band's CR");
             }
-            open(lo * 95 / 100).expect("open at 95% of the ICR boundary");
         }
 
         kitchensink_runtime::Balances::transfer_allow_death(
@@ -707,12 +754,22 @@ mod price_replay {
         byte as usize * series().len() / 256
     }
 
+    /// The vaults math multiplies this price by RAW collateral units to get
+    /// RAW stable units, so the oracle inner is not USD-per-token: it must be
+    /// scaled by 10^(stable_decimals - native_decimals). Kitchensink's
+    /// stablecoin carries 6 decimals and DOLLARS = 10^14, so the USD-per-token
+    /// series from [`crate::oct10`] is divided by 10^8. Feeding the unscaled
+    /// value prices $37 of collateral as $37M, the ICR bound lands beyond the
+    /// branch debt ceiling, and every genesis CR silently loses its meaning;
+    /// that is how this constant was found.
+    const RAW_UNIT_SCALE: u128 = 100_000_000;
+
     pub fn price_at(start_tick: usize, block: u32) -> u128 {
         let s = series();
         let idx = start_tick
             .saturating_add((block as usize).saturating_mul(TICKS_PER_BLOCK))
             .min(s.len() - 1);
-        s[idx]
+        s[idx] / RAW_UNIT_SCALE
     }
 
     /// Feed the tick's price from every oracle member. Errors are ignored on
