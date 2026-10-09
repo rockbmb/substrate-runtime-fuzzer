@@ -7137,6 +7137,7 @@ dependencies = [
  "sp-crypto-hashing 0.1.0",
  "sp-runtime",
  "sp-state-machine",
+ "sp-tracing",
  "ziggy",
 ]
 

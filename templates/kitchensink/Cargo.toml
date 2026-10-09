@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ziggy = { workspace = true }
+sp-tracing = { workspace = true, default-features = true }
 
 kitchensink-runtime = { workspace = true }
 

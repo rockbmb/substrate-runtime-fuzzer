@@ -32,6 +32,11 @@ use std::{
 mod oct10;
 
 fn main() {
+    // The runtime reports try_state failures through `log`; without a
+    // subscriber every "See logs for more info" leads nowhere. RUST_LOG
+    // applies; fuzzing runs leave it unset and pay nothing.
+    sp_tracing::try_init_simple();
+
     let accounts: Vec<AccountId> = (0..5).map(|i| [i; 32].into()).collect();
     let genesis = generate_genesis(&accounts);
 
